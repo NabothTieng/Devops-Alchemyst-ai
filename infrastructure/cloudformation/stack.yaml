@@ -1,0 +1,149 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Alchemyst AI DevOps Assignment - VPC + 3 EC2 Instances'
+
+Parameters:
+  KeyName:
+    Description: Name of an existing EC2 KeyPair
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: devops-intern-key
+
+Resources:
+  AlchemystVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: alchemyst-devops-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: alchemyst-igw
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref AlchemystVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref AlchemystVPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: public-api-subnet
+
+  PrivateSubnetMath:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref AlchemystVPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: private-math-subnet
+
+  PrivateSubnetCaller:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref AlchemystVPC
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: private-caller-subnet
+
+  PublicSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public API + SSH
+      VpcId: !Ref AlchemystVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 3111
+          ToPort: 3111
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: public-sg
+
+  PrivateSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Internal RPC + SSH
+      VpcId: !Ref AlchemystVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 10.0.0.0/16
+        - IpProtocol: tcp
+          FromPort: 49134
+          ToPort: 49134
+          CidrIp: 10.0.0.0/16
+      Tags:
+        - Key: Name
+          Value: private-rpc-sg
+
+  APIGatewayInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      ImageId: ami-0c7217cdde317cfec   # Amazon Linux 2023 - update if needed
+      KeyName: !Ref KeyName
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref PublicSecurityGroup
+      Tags:
+        - Key: Name
+          Value: api-gateway-vm
+
+  MathWorkerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      ImageId: ami-0c7217cdde317cfec
+      KeyName: !Ref KeyName
+      SubnetId: !Ref PrivateSubnetMath
+      SecurityGroupIds:
+        - !Ref PrivateSecurityGroup
+      Tags:
+        - Key: Name
+          Value: math-worker-vm
+
+  CallerWorkerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      ImageId: ami-0c7217cdde317cfec
+      KeyName: !Ref KeyName
+      SubnetId: !Ref PrivateSubnetCaller
+      SecurityGroupIds:
+        - !Ref PrivateSecurityGroup
+      Tags:
+        - Key: Name
+          Value: caller-worker-vm
+
+Outputs:
+  APIGatewayPublicDNS:
+    Description: Public DNS of API Gateway
+    Value: !GetAtt APIGatewayInstance.PublicDnsName
+  APIGatewayPublicIP:
+    Description: Public IP of API Gateway
+    Value: !GetAtt APIGatewayInstance.PublicIp
+  StackCleanupNote:
+    Description: How to destroy everything
+    Value: "Go to CloudFormation → Select this stack → Click Delete"
