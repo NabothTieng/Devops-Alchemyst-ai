@@ -140,7 +140,6 @@ Resources:
           ToPort: 49134
           CidrIp: 10.0.0.0/16
 
-  # ── PUBLIC VM: Engine + iii-http + iii-state ──────────────────
   APIGatewayInstance:
     Type: AWS::EC2::Instance
     Properties:
@@ -157,19 +156,19 @@ Resources:
         Fn::Base64: |
           #!/bin/bash
           exec > /var/log/userdata.log 2>&1
+          export HOME=/root
+          export PATH=$PATH:/root/.local/bin
 
-          # Install iii
+          yum install -y git
+
           curl -fsSL https://install.iii.dev/iii/main/install.sh | sh
           export PATH=$PATH:/root/.local/bin
 
-          # Init the quickstart project
           cd /opt
-          iii project init quickstart --template quickstart
+          /root/.local/bin/iii project init quickstart --template quickstart
           cd /opt/quickstart
 
-          # Write config.yaml - engine + iii-http (public) + iii-state
-          # math-worker and caller-worker will connect remotely
-          cat > config.yaml << 'CFG'
+          cat > /opt/quickstart/config.yaml << 'CFG'
           workers:
             - name: iii-http
               config:
@@ -186,7 +185,6 @@ Resources:
 
           mkdir -p /opt/quickstart/data
 
-          # Systemd service for the engine
           cat > /etc/systemd/system/iii-engine.service << 'SVC'
           [Unit]
           Description=iii Engine
@@ -207,7 +205,6 @@ Resources:
           systemctl start iii-engine
           echo "API Gateway VM setup complete"
 
-  # ── PRIVATE VM 1: Python Math Worker ─────────────────────────
   MathWorkerInstance:
     Type: AWS::EC2::Instance
     DependsOn: APIGatewayInstance
@@ -227,22 +224,20 @@ Resources:
             - |
               #!/bin/bash
               exec > /var/log/userdata.log 2>&1
+              export HOME=/root
+              export PATH=$PATH:/root/.local/bin
 
-              # Install iii (includes Python SDK)
+              yum install -y git python3 python3-pip
+
               curl -fsSL https://install.iii.dev/iii/main/install.sh | sh
               export PATH=$PATH:/root/.local/bin
 
-              yum install -y python3 python3-pip
-
-              # Init project just to get the worker code
               cd /opt
-              iii project init quickstart --template quickstart
+              /root/.local/bin/iii project init quickstart --template quickstart
               cd /opt/quickstart/workers/math-worker
 
-              # Install Python deps
               pip3 install -r requirements.txt
 
-              # Systemd service - connects to engine on API Gateway private IP
               cat > /etc/systemd/system/math-worker.service << 'SVC'
               [Unit]
               Description=iii Math Worker
@@ -264,7 +259,6 @@ Resources:
               echo "Math Worker VM setup complete"
             - EngineIP: !GetAtt APIGatewayInstance.PrivateIp
 
-  # ── PRIVATE VM 2: TypeScript Caller Worker ────────────────────
   CallerWorkerInstance:
     Type: AWS::EC2::Instance
     DependsOn: APIGatewayInstance
@@ -284,22 +278,20 @@ Resources:
             - |
               #!/bin/bash
               exec > /var/log/userdata.log 2>&1
-
-              # Install iii
-              curl -fsSL https://install.iii.dev/iii/main/install.sh | sh
+              export HOME=/root
               export PATH=$PATH:/root/.local/bin
 
-              # Install Node.js 20
+              yum install -y git
               curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
               yum install -y nodejs
 
-              # Init project to get the worker code
+              curl -fsSL https://install.iii.dev/iii/main/install.sh | sh
+              export PATH=$PATH:/root/.local/bin
+
               cd /opt
-              iii project init quickstart --template quickstart
+              /root/.local/bin/iii project init quickstart --template quickstart
               cd /opt/quickstart/workers/caller-worker
 
-              # Uncomment the HTTP block in worker.ts
-              # The quickstart has the HTTP registration commented out by default
               cat > src/worker.ts << 'WORKER'
               import { registerWorker } from "iii-sdk";
 
@@ -340,7 +332,6 @@ Resources:
 
               npm install
 
-              # Systemd service
               cat > /etc/systemd/system/caller-worker.service << 'SVC'
               [Unit]
               Description=iii Caller Worker
