@@ -109,7 +109,7 @@ Resources:
   PublicSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Allow SSH and HTTP
+      GroupDescription: Allow SSH, HTTP API, and engine WebSocket
       VpcId: !Ref AlchemystVPC
       SecurityGroupIngress:
         - IpProtocol: tcp
@@ -140,6 +140,7 @@ Resources:
           ToPort: 49134
           CidrIp: 10.0.0.0/16
 
+  # ── PUBLIC VM: Engine + iii-http + iii-state ──────────────────
   APIGatewayInstance:
     Type: AWS::EC2::Instance
     Properties:
@@ -155,52 +156,58 @@ Resources:
       UserData:
         Fn::Base64: |
           #!/bin/bash
-          set -e
-          exec > /var/log/user-data.log 2>&1
+          exec > /var/log/userdata.log 2>&1
 
-          yum update -y
-          yum install -y git
-          curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
-          yum install -y nodejs
+          # Install iii
+          curl -fsSL https://install.iii.dev/iii/main/install.sh | sh
+          export PATH=$PATH:/root/.local/bin
 
-          npm install -g iii-workbench
+          # Init the quickstart project
+          cd /opt
+          iii project init quickstart --template quickstart
+          cd /opt/quickstart
 
-          git clone https://github.com/iii-org/iii-quickstart /opt/iii-quickstart
-          cd /opt/iii-quickstart && npm install
-          cd /opt/iii-quickstart/http-worker && npm install
+          # Write config.yaml - engine + iii-http (public) + iii-state
+          # math-worker and caller-worker will connect remotely
+          cat > config.yaml << 'CFG'
+          workers:
+            - name: iii-http
+              config:
+                port: 3111
+                host: 0.0.0.0
+            - name: iii-state
+              config:
+                adapter:
+                  name: kv
+                  config:
+                    store_method: file_based
+                    file_path: /opt/quickstart/data/state_store.db
+          CFG
 
+          mkdir -p /opt/quickstart/data
+
+          # Systemd service for the engine
           cat > /etc/systemd/system/iii-engine.service << 'SVC'
           [Unit]
           Description=iii Engine
           After=network.target
           [Service]
-          WorkingDirectory=/opt/iii-quickstart
-          ExecStart=/usr/local/bin/iii engine
+          WorkingDirectory=/opt/quickstart
+          ExecStart=/root/.local/bin/iii --config /opt/quickstart/config.yaml
           Restart=always
+          RestartSec=5
           Environment=HOME=/root
-          [Install]
-          WantedBy=multi-user.target
-          SVC
-
-          cat > /etc/systemd/system/iii-http.service << 'SVC'
-          [Unit]
-          Description=iii HTTP Worker
-          After=iii-engine.service
-          [Service]
-          WorkingDirectory=/opt/iii-quickstart/http-worker
-          ExecStart=/usr/local/bin/iii run
-          Restart=always
-          Environment=HOME=/root
+          Environment=PATH=/root/.local/bin:/usr/local/bin:/usr/bin:/bin
           [Install]
           WantedBy=multi-user.target
           SVC
 
           systemctl daemon-reload
-          systemctl enable iii-engine iii-http
+          systemctl enable iii-engine
           systemctl start iii-engine
-          sleep 5
-          systemctl start iii-http
+          echo "API Gateway VM setup complete"
 
+  # ── PRIVATE VM 1: Python Math Worker ─────────────────────────
   MathWorkerInstance:
     Type: AWS::EC2::Instance
     DependsOn: APIGatewayInstance
@@ -219,26 +226,34 @@ Resources:
           !Sub
             - |
               #!/bin/bash
-              set -e
-              exec > /var/log/user-data.log 2>&1
+              exec > /var/log/userdata.log 2>&1
 
-              yum update -y
-              yum install -y git python3 python3-pip
+              # Install iii (includes Python SDK)
+              curl -fsSL https://install.iii.dev/iii/main/install.sh | sh
+              export PATH=$PATH:/root/.local/bin
 
-              git clone https://github.com/iii-org/iii-quickstart /opt/iii-quickstart
-              cd /opt/iii-quickstart/math-worker
+              yum install -y python3 python3-pip
+
+              # Init project just to get the worker code
+              cd /opt
+              iii project init quickstart --template quickstart
+              cd /opt/quickstart/workers/math-worker
+
+              # Install Python deps
               pip3 install -r requirements.txt
 
+              # Systemd service - connects to engine on API Gateway private IP
               cat > /etc/systemd/system/math-worker.service << 'SVC'
               [Unit]
               Description=iii Math Worker
               After=network.target
               [Service]
-              WorkingDirectory=/opt/iii-quickstart/math-worker
-              ExecStart=/usr/bin/python3 main.py
+              WorkingDirectory=/opt/quickstart/workers/math-worker
+              ExecStart=/usr/bin/python3 math_worker.py
               Restart=always
-              Environment=III_ENGINE_URL=ws://${EnginePrivateIp}:49134
+              RestartSec=5
               Environment=HOME=/root
+              Environment=III_URL=ws://${EngineIP}:49134
               [Install]
               WantedBy=multi-user.target
               SVC
@@ -246,8 +261,10 @@ Resources:
               systemctl daemon-reload
               systemctl enable math-worker
               systemctl start math-worker
-            - EnginePrivateIp: !GetAtt APIGatewayInstance.PrivateIp
+              echo "Math Worker VM setup complete"
+            - EngineIP: !GetAtt APIGatewayInstance.PrivateIp
 
+  # ── PRIVATE VM 2: TypeScript Caller Worker ────────────────────
   CallerWorkerInstance:
     Type: AWS::EC2::Instance
     DependsOn: APIGatewayInstance
@@ -266,28 +283,75 @@ Resources:
           !Sub
             - |
               #!/bin/bash
-              set -e
-              exec > /var/log/user-data.log 2>&1
+              exec > /var/log/userdata.log 2>&1
 
-              yum update -y
-              yum install -y git
+              # Install iii
+              curl -fsSL https://install.iii.dev/iii/main/install.sh | sh
+              export PATH=$PATH:/root/.local/bin
+
+              # Install Node.js 20
               curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
               yum install -y nodejs
 
-              git clone https://github.com/iii-org/iii-quickstart /opt/iii-quickstart
-              cd /opt/iii-quickstart/caller-worker
+              # Init project to get the worker code
+              cd /opt
+              iii project init quickstart --template quickstart
+              cd /opt/quickstart/workers/caller-worker
+
+              # Uncomment the HTTP block in worker.ts
+              # The quickstart has the HTTP registration commented out by default
+              cat > src/worker.ts << 'WORKER'
+              import { registerWorker } from "iii-sdk";
+
+              const worker = registerWorker(process.env.III_URL);
+
+              worker.registerFunction(
+                "math::add_two_numbers",
+                async (payload: { a: number; b: number }) => {
+                  const result = await worker.trigger({
+                    function_id: "math::add",
+                    payload: { a: payload.a, b: payload.b },
+                  });
+                  return result;
+                },
+              );
+
+              worker.registerFunction(
+                "http::add_two_numbers",
+                async (payload: { body: { a: number; b: number } }) => {
+                  const result = await worker.trigger({
+                    function_id: "math::add_two_numbers",
+                    payload: payload.body,
+                  });
+                  return {
+                    status_code: 200,
+                    body: { c: result.c, running_total: result.running_total },
+                    headers: { "Content-Type": "application/json" },
+                  };
+                },
+              );
+
+              worker.registerTrigger({
+                type: "http",
+                function_id: "http::add_two_numbers",
+                config: { api_path: "/math/add-two-numbers", http_method: "POST" },
+              });
+              WORKER
+
               npm install
 
+              # Systemd service
               cat > /etc/systemd/system/caller-worker.service << 'SVC'
               [Unit]
               Description=iii Caller Worker
               After=network.target
               [Service]
-              WorkingDirectory=/opt/iii-quickstart/caller-worker
-              ExecStart=/usr/bin/npm start
+              WorkingDirectory=/opt/quickstart/workers/caller-worker
+              ExecStart=/usr/bin/npx ts-node src/worker.ts
               Restart=always
-              Environment=III_ENGINE_URL=ws://${EnginePrivateIp}:49134
+              RestartSec=5
               Environment=HOME=/root
+              Environment=III_URL=ws://${EngineIP}:49134
               [Install]
               WantedBy=multi-user.target
               SVC
@@ -295,15 +359,16 @@ Resources:
               systemctl daemon-reload
               systemctl enable caller-worker
               systemctl start caller-worker
-            - EnginePrivateIp: !GetAtt APIGatewayInstance.PrivateIp
+              echo "Caller Worker VM setup complete"
+            - EngineIP: !GetAtt APIGatewayInstance.PrivateIp
 
 Outputs:
   APIGatewayPublicIP:
-    Description: Hit this IP to test your JSON API
+    Description: Public IP to test the API
     Value: !GetAtt APIGatewayInstance.PublicIp
   APIGatewayPrivateIP:
-    Description: Engine private IP (injected into workers automatically)
+    Description: Engine private IP injected into workers
     Value: !GetAtt APIGatewayInstance.PrivateIp
   TestCommand:
-    Description: curl command to test the API
-    Value: !Sub 'curl -X POST http://${APIGatewayInstance.PublicIp}:3111/math/add_two_numbers -H "Content-Type: application/json" -d "{\"a\": 15, \"b\": 27}"'
+    Description: curl command to test
+    Value: !Sub 'curl -X POST http://${APIGatewayInstance.PublicIp}:3111/math/add-two-numbers -H "Content-Type: application/json" -d "{\"a\": 15, \"b\": 27}"'
