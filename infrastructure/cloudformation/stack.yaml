@@ -1,11 +1,14 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'Alchemyst AI DevOps Assignment - VPC + 3 EC2 Instances'
+Description: 'Alchemyst AI DevOps Assignment - VPC + 3 Self-Configuring EC2s'
 
 Parameters:
   KeyName:
     Description: Name of an existing EC2 KeyPair
     Type: AWS::EC2::KeyPair::KeyName
     Default: devops-intern-key
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64'
 
 Resources:
   AlchemystVPC:
@@ -20,10 +23,6 @@ Resources:
 
   InternetGateway:
     Type: AWS::EC2::InternetGateway
-    Properties:
-      Tags:
-        - Key: Name
-          Value: alchemyst-igw
 
   AttachGateway:
     Type: AWS::EC2::VPCGatewayAttachment
@@ -38,9 +37,6 @@ Resources:
       CidrBlock: 10.0.1.0/24
       MapPublicIpOnLaunch: true
       AvailabilityZone: !Select [0, !GetAZs '']
-      Tags:
-        - Key: Name
-          Value: public-api-subnet
 
   PrivateSubnetMath:
     Type: AWS::EC2::Subnet
@@ -48,9 +44,6 @@ Resources:
       VpcId: !Ref AlchemystVPC
       CidrBlock: 10.0.2.0/24
       AvailabilityZone: !Select [0, !GetAZs '']
-      Tags:
-        - Key: Name
-          Value: private-math-subnet
 
   PrivateSubnetCaller:
     Type: AWS::EC2::Subnet
@@ -58,14 +51,65 @@ Resources:
       VpcId: !Ref AlchemystVPC
       CidrBlock: 10.0.3.0/24
       AvailabilityZone: !Select [0, !GetAZs '']
-      Tags:
-        - Key: Name
-          Value: private-caller-subnet
+
+  NatEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEIP.AllocationId
+      SubnetId: !Ref PublicSubnet
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref AlchemystVPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref AlchemystVPC
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateMathAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetMath
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateCallerAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetCaller
+      RouteTableId: !Ref PrivateRouteTable
 
   PublicSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Public API + SSH
+      GroupDescription: Allow SSH and HTTP
       VpcId: !Ref AlchemystVPC
       SecurityGroupIngress:
         - IpProtocol: tcp
@@ -76,14 +120,15 @@ Resources:
           FromPort: 3111
           ToPort: 3111
           CidrIp: 0.0.0.0/0
-      Tags:
-        - Key: Name
-          Value: public-sg
+        - IpProtocol: tcp
+          FromPort: 49134
+          ToPort: 49134
+          CidrIp: 10.0.0.0/16
 
   PrivateSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Internal RPC + SSH
+      GroupDescription: Allow internal traffic only
       VpcId: !Ref AlchemystVPC
       SecurityGroupIngress:
         - IpProtocol: tcp
@@ -94,15 +139,12 @@ Resources:
           FromPort: 49134
           ToPort: 49134
           CidrIp: 10.0.0.0/16
-      Tags:
-        - Key: Name
-          Value: private-rpc-sg
 
   APIGatewayInstance:
     Type: AWS::EC2::Instance
     Properties:
       InstanceType: t3.micro
-      ImageId: ami-0c7217cdde317cfec   # Amazon Linux 2023 - update if needed
+      ImageId: !Ref LatestAmiId
       KeyName: !Ref KeyName
       SubnetId: !Ref PublicSubnet
       SecurityGroupIds:
@@ -110,12 +152,61 @@ Resources:
       Tags:
         - Key: Name
           Value: api-gateway-vm
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -e
+          exec > /var/log/user-data.log 2>&1
+
+          yum update -y
+          yum install -y git
+          curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
+          yum install -y nodejs
+
+          npm install -g iii-workbench
+
+          git clone https://github.com/iii-org/iii-quickstart /opt/iii-quickstart
+          cd /opt/iii-quickstart && npm install
+          cd /opt/iii-quickstart/http-worker && npm install
+
+          cat > /etc/systemd/system/iii-engine.service << 'SVC'
+          [Unit]
+          Description=iii Engine
+          After=network.target
+          [Service]
+          WorkingDirectory=/opt/iii-quickstart
+          ExecStart=/usr/local/bin/iii engine
+          Restart=always
+          Environment=HOME=/root
+          [Install]
+          WantedBy=multi-user.target
+          SVC
+
+          cat > /etc/systemd/system/iii-http.service << 'SVC'
+          [Unit]
+          Description=iii HTTP Worker
+          After=iii-engine.service
+          [Service]
+          WorkingDirectory=/opt/iii-quickstart/http-worker
+          ExecStart=/usr/local/bin/iii run
+          Restart=always
+          Environment=HOME=/root
+          [Install]
+          WantedBy=multi-user.target
+          SVC
+
+          systemctl daemon-reload
+          systemctl enable iii-engine iii-http
+          systemctl start iii-engine
+          sleep 5
+          systemctl start iii-http
 
   MathWorkerInstance:
     Type: AWS::EC2::Instance
+    DependsOn: APIGatewayInstance
     Properties:
       InstanceType: t3.micro
-      ImageId: ami-0c7217cdde317cfec
+      ImageId: !Ref LatestAmiId
       KeyName: !Ref KeyName
       SubnetId: !Ref PrivateSubnetMath
       SecurityGroupIds:
@@ -123,12 +214,46 @@ Resources:
       Tags:
         - Key: Name
           Value: math-worker-vm
+      UserData:
+        Fn::Base64:
+          !Sub
+            - |
+              #!/bin/bash
+              set -e
+              exec > /var/log/user-data.log 2>&1
+
+              yum update -y
+              yum install -y git python3 python3-pip
+
+              git clone https://github.com/iii-org/iii-quickstart /opt/iii-quickstart
+              cd /opt/iii-quickstart/math-worker
+              pip3 install -r requirements.txt
+
+              cat > /etc/systemd/system/math-worker.service << 'SVC'
+              [Unit]
+              Description=iii Math Worker
+              After=network.target
+              [Service]
+              WorkingDirectory=/opt/iii-quickstart/math-worker
+              ExecStart=/usr/bin/python3 main.py
+              Restart=always
+              Environment=III_ENGINE_URL=ws://${EnginePrivateIp}:49134
+              Environment=HOME=/root
+              [Install]
+              WantedBy=multi-user.target
+              SVC
+
+              systemctl daemon-reload
+              systemctl enable math-worker
+              systemctl start math-worker
+            - EnginePrivateIp: !GetAtt APIGatewayInstance.PrivateIp
 
   CallerWorkerInstance:
     Type: AWS::EC2::Instance
+    DependsOn: APIGatewayInstance
     Properties:
       InstanceType: t3.micro
-      ImageId: ami-0c7217cdde317cfec
+      ImageId: !Ref LatestAmiId
       KeyName: !Ref KeyName
       SubnetId: !Ref PrivateSubnetCaller
       SecurityGroupIds:
@@ -136,14 +261,49 @@ Resources:
       Tags:
         - Key: Name
           Value: caller-worker-vm
+      UserData:
+        Fn::Base64:
+          !Sub
+            - |
+              #!/bin/bash
+              set -e
+              exec > /var/log/user-data.log 2>&1
+
+              yum update -y
+              yum install -y git
+              curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
+              yum install -y nodejs
+
+              git clone https://github.com/iii-org/iii-quickstart /opt/iii-quickstart
+              cd /opt/iii-quickstart/caller-worker
+              npm install
+
+              cat > /etc/systemd/system/caller-worker.service << 'SVC'
+              [Unit]
+              Description=iii Caller Worker
+              After=network.target
+              [Service]
+              WorkingDirectory=/opt/iii-quickstart/caller-worker
+              ExecStart=/usr/bin/npm start
+              Restart=always
+              Environment=III_ENGINE_URL=ws://${EnginePrivateIp}:49134
+              Environment=HOME=/root
+              [Install]
+              WantedBy=multi-user.target
+              SVC
+
+              systemctl daemon-reload
+              systemctl enable caller-worker
+              systemctl start caller-worker
+            - EnginePrivateIp: !GetAtt APIGatewayInstance.PrivateIp
 
 Outputs:
-  APIGatewayPublicDNS:
-    Description: Public DNS of API Gateway
-    Value: !GetAtt APIGatewayInstance.PublicDnsName
   APIGatewayPublicIP:
-    Description: Public IP of API Gateway
+    Description: Hit this IP to test your JSON API
     Value: !GetAtt APIGatewayInstance.PublicIp
-  StackCleanupNote:
-    Description: How to destroy everything
-    Value: "Go to CloudFormation → Select this stack → Click Delete"
+  APIGatewayPrivateIP:
+    Description: Engine private IP (injected into workers automatically)
+    Value: !GetAtt APIGatewayInstance.PrivateIp
+  TestCommand:
+    Description: curl command to test the API
+    Value: !Sub 'curl -X POST http://${APIGatewayInstance.PublicIp}:3111/math/add_two_numbers -H "Content-Type: application/json" -d "{\"a\": 15, \"b\": 27}"'
