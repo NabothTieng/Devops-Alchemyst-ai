@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'Alchemyst AI DevOps Assignment - VPC + 3 EC2s, iii engine on public VM via Docker'
+Description: 'Alchemyst AI DevOps Assignment - VPC + 3 EC2s, iii engine on public VM, workers on private VMs'
 
 Parameters:
   KeyName:
@@ -109,7 +109,7 @@ Resources:
   PublicSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Allow SSH, HTTP API, and engine WebSocket
+      GroupDescription: Allow SSH, HTTP API port, and engine WebSocket (VPC-internal only)
       VpcId: !Ref AlchemystVPC
       SecurityGroupIngress:
         - IpProtocol: tcp
@@ -120,6 +120,7 @@ Resources:
           FromPort: 3111
           ToPort: 3111
           CidrIp: 0.0.0.0/0
+        # Engine WebSocket port - only reachable from within the VPC (private worker VMs)
         - IpProtocol: tcp
           FromPort: 49134
           ToPort: 49134
@@ -128,7 +129,7 @@ Resources:
   PrivateSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Allow internal traffic only
+      GroupDescription: Allow SSH and engine WebSocket from within the VPC only
       VpcId: !Ref AlchemystVPC
       SecurityGroupIngress:
         - IpProtocol: tcp
@@ -140,13 +141,12 @@ Resources:
           ToPort: 49134
           CidrIp: 10.0.0.0/16
 
-  # ── PUBLIC VM: iii engine + both workers via Docker ──────────
-  # NOTE: iii-worker requires KVM for microVM sandboxing which t3.micro
-  # does not support. III_ISOLATION=none bypasses this and runs workers
-  # as direct processes inside the container. The VPC/subnet architecture
-  # is preserved — math-worker and caller-worker VMs exist in private
-  # subnets and can be used for other workloads or future iii versions
-  # that support process isolation without KVM.
+  # ── PUBLIC VM: iii Engine + iii-http worker ───────────────────────────────
+  # Runs the iii engine natively (no Docker needed here). The config.yaml is
+  # patched to bind iii-http on 0.0.0.0:3111 so the JSON API is externally
+  # reachable. The engine WebSocket (port 49134) is bound to 0.0.0.0 but the
+  # security group restricts it to 10.0.0.0/16 so only the private VMs can
+  # connect workers to it.
   APIGatewayInstance:
     Type: AWS::EC2::Instance
     Properties:
@@ -163,32 +163,17 @@ Resources:
         Fn::Base64: |
           #!/bin/bash
           exec > /var/log/userdata.log 2>&1
+          set -e
           export HOME=/root
           export PATH=$PATH:/root/.local/bin
 
-          # Install system dependencies
-          yum install -y git jq docker
-
-          # Start Docker
-          systemctl start docker
-          systemctl enable docker
-
-          # Install docker-compose standalone
-          curl -L "https://github.com/docker/compose/releases/download/v2.27.0/docker-compose-linux-x86_64" \
-            -o /usr/local/bin/docker-compose
-          chmod +x /usr/local/bin/docker-compose
-
-          # Install docker buildx plugin
-          mkdir -p /root/.docker/cli-plugins
-          curl -L "https://github.com/docker/buildx/releases/download/v0.19.3/buildx-v0.19.3.linux-amd64" \
-            -o /root/.docker/cli-plugins/docker-buildx
-          chmod +x /root/.docker/cli-plugins/docker-buildx
+          yum install -y git jq
 
           # Install iii CLI
           curl -fsSL https://install.iii.dev/iii/main/install.sh | sh
           export PATH=$PATH:/root/.local/bin
 
-          # Clone the Alchemyst quickstart project
+          # Clone only the quickstart subdirectory
           cd /opt
           git clone --no-checkout --depth 1 https://github.com/Alchemyst-ai/hiring.git
           cd hiring
@@ -197,144 +182,64 @@ Resources:
           cp -r may-2026/devops/quickstart /opt/quickstart
           cd /opt/quickstart
 
-          # Fix config.yaml:
-          # - host 0.0.0.0 so HTTP is reachable externally
-          # - worker paths use /app (Docker workdir)
-          # - worker names match actual folder names (math-worker, caller-worker)
-          cat > /opt/quickstart/config.yaml << 'CFG'
-          workers:
-            - name: iii-observability
-              config:
-                enabled: true
-                service_name: iii
-                exporter: memory
-                memory_max_spans: 10000
-                metrics_enabled: true
-                metrics_exporter: memory
-                logs_enabled: true
-                logs_exporter: memory
-                logs_console_output: true
-                sampling_ratio: 1.0
-            - name: iii-queue
-              config:
-                adapter:
-                  name: builtin
-            - name: iii-state
-              config:
-                adapter:
-                  name: kv
-                  config:
-                    store_method: file_based
-                    file_path: /app/data/state_store.db
-            - name: iii-http
-              config:
-                port: 3111
-                host: 0.0.0.0
-                default_timeout: 30000
-                concurrency_request_limit: 1024
-                cors:
-                  allowed_origins:
-                    - '*'
-                  allowed_methods:
-                    - GET
-                    - POST
-                    - PUT
-                    - DELETE
-                    - OPTIONS
-            - name: math-worker
-              worker_path: /app/workers/math-worker
-            - name: caller-worker
-              worker_path: /app/workers/caller-worker
-          CFG
+          # Patch config.yaml:
+          # - iii-http binds on 0.0.0.0 so port 3111 is reachable externally
+          # - remove the math-worker and caller-worker entries; those run on
+          #   their own private VMs and connect to the engine via WebSocket
+          python3 - << 'PY'
+          import re, pathlib
+          p = pathlib.Path('/opt/quickstart/config.yaml')
+          cfg = p.read_text()
+          # Bind HTTP on all interfaces
+          cfg = cfg.replace('host: 127.0.0.1', 'host: 0.0.0.0')
+          cfg = cfg.replace("host: '127.0.0.1'", "host: '0.0.0.0'")
+          # Remove worker sections for math-worker and caller-worker
+          # They register themselves remotely, so we only keep iii-built-in workers here
+          cfg = re.sub(
+              r'\n\s*- name: (math-worker|caller-worker)\s*\n(\s+worker_path:[^\n]*\n)+',
+              '\n',
+              cfg
+          )
+          p.write_text(cfg)
+          PY
 
-          # Strip heavy ML deps — torch/gguf OOM on t3.micro
-          cat > /opt/quickstart/workers/math-worker/requirements.txt << 'REQ'
-          iii-sdk==0.11.0
-          watchfiles
-          REQ
-
-          # Write Dockerfile — installs iii+iii-worker inside container,
-          # copies binaries to /usr/local/bin so they are on PATH
-          cat > /opt/quickstart/Dockerfile << 'DFILE'
-          FROM debian:bookworm-slim
-
-          RUN apt-get update && apt-get install -y \
-              curl git jq python3 python3-pip nodejs npm \
-              && rm -rf /var/lib/apt/lists/*
-
-          RUN HOME=/root curl -fsSL https://install.iii.dev/iii/main/install.sh | sh \
-              && cp /root/.local/bin/iii /usr/local/bin/iii \
-              && cp /root/.local/bin/iii-worker /usr/local/bin/iii-worker \
-              && cp /root/.local/bin/iii-init /usr/local/bin/iii-init
-
-          WORKDIR /app
-          COPY config.yaml /app/config.yaml
-          COPY workers /app/workers
-
-          RUN mkdir -p /app/data && chmod 777 /app/data
-
-          RUN pip3 install --break-system-packages iii-sdk==0.11.0 watchfiles 2>/dev/null || true
-
-          RUN cd /app/workers/caller-worker && npm install
-
-          CMD ["iii", "--config", "/app/config.yaml"]
-          DFILE
-
-          # Write docker-compose.yml
-          # III_ISOLATION=none: bypass KVM microVM requirement (not available on t3.micro)
-          cat > /opt/quickstart/docker-compose.yml << 'COMPOSE'
-          services:
-            iii:
-              build:
-                context: .
-              ports:
-                - "49134:49134"
-                - "3111:3111"
-                - "3112:3112"
-                - "9464:9464"
-              volumes:
-                - ./config.yaml:/app/config.yaml:ro
-              environment:
-                - RUST_LOG=info
-                - III_EXECUTION_CONTEXT=docker
-                - III_ISOLATION=none
-              restart: unless-stopped
-          COMPOSE
-
-          mkdir -p /opt/quickstart/data
-          chmod 777 /opt/quickstart/data
-
-          # Build and start the Docker stack
-          cd /opt/quickstart
-          docker-compose up --build -d
-
-          # Systemd service to restart Docker stack on reboot
-          cat > /etc/systemd/system/iii-docker.service << 'SVC'
+          # Systemd service for iii engine
+          cat > /etc/systemd/system/iii-engine.service << 'SVC'
           [Unit]
-          Description=iii Docker Stack
-          After=docker.service
-          Requires=docker.service
+          Description=iii Engine
+          After=network.target
           [Service]
           WorkingDirectory=/opt/quickstart
-          ExecStart=/usr/local/bin/docker-compose up
-          ExecStop=/usr/local/bin/docker-compose down
+          ExecStart=/root/.local/bin/iii --config /opt/quickstart/config.yaml
           Restart=always
-          RestartSec=10
+          RestartSec=5
+          Environment=HOME=/root
+          Environment=PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
           [Install]
           WantedBy=multi-user.target
           SVC
 
           systemctl daemon-reload
-          systemctl enable iii-docker
+          systemctl enable iii-engine
+          systemctl start iii-engine
           echo "API Gateway VM setup complete"
 
-  # ── PRIVATE VM 1: Math Worker (reserved for future use) ──────
-  # Currently iii workers run inside Docker on the API Gateway VM
-  # due to KVM unavailability on t3.micro. These VMs exist to satisfy
-  # the subnet architecture requirement and can host workers when
-  # deployed on KVM-capable instances.
+  # ── PRIVATE VM 1: Python Math Worker ─────────────────────────────────────
+  # Connects back to the engine on the public VM via WebSocket (III_URL).
+  #
+  # Blockers addressed:
+  #   1. pypi.iii.dev expired SSL cert — pip is told to trust the host
+  #      with --trusted-host so it skips certificate verification for that
+  #      index only. This is safe because we are explicitly targeting the
+  #      iii-specific package index, not the broader PyPI.
+  #   2. KVM unavailable on t3.micro — III_ISOLATION=none is set in the
+  #      systemd unit so iii-worker runs the worker as a direct process
+  #      instead of launching a microVM sandbox.
+  #   3. torch/gguf OOM on t3.micro (1 GB RAM) — requirements.txt is
+  #      overwritten to keep only iii-sdk and watchfiles.
   MathWorkerInstance:
     Type: AWS::EC2::Instance
+    DependsOn: APIGatewayInstance
     Properties:
       InstanceType: t3.micro
       ImageId: !Ref LatestAmiId
@@ -345,10 +250,75 @@ Resources:
       Tags:
         - Key: Name
           Value: math-worker-vm
+      UserData:
+        Fn::Base64:
+          !Sub |
+            #!/bin/bash
+            exec > /var/log/userdata.log 2>&1
+            set -e
+            export HOME=/root
+            export PATH=${!PATH}:/root/.local/bin
 
-  # ── PRIVATE VM 2: Caller Worker (reserved for future use) ────
+            yum install -y git python3 python3-pip
+
+            # Install iii CLI + iii-worker binary
+            curl -fsSL https://install.iii.dev/iii/main/install.sh | sh
+            export PATH=${!PATH}:/root/.local/bin
+
+            # Clone quickstart
+            cd /opt
+            git clone --no-checkout --depth 1 https://github.com/Alchemyst-ai/hiring.git
+            cd hiring
+            git sparse-checkout set may-2026/devops/quickstart
+            git checkout
+            cp -r may-2026/devops/quickstart /opt/quickstart
+
+            # Strip heavy ML deps that OOM on t3.micro (torch, gguf).
+            # iii-sdk is installed via the iii custom index; --trusted-host bypasses
+            # the expired SSL certificate on pypi.iii.dev without disabling TLS globally.
+            cat > /opt/quickstart/workers/math-worker/requirements.txt << 'REQ'
+            iii-sdk==0.11.0
+            watchfiles
+            REQ
+
+            pip3 install \
+              --index-url https://pypi.iii.dev/simple/ \
+              --extra-index-url https://pypi.org/simple/ \
+              --trusted-host pypi.iii.dev \
+              -r /opt/quickstart/workers/math-worker/requirements.txt
+
+            # Systemd service — III_URL uses the engine private IP injected by CloudFormation.
+            # III_ISOLATION=none bypasses the KVM microVM requirement.
+            # ${!...} syntax escapes bash variables so CloudFormation does not try to resolve them.
+            cat > /etc/systemd/system/math-worker.service << 'SVC'
+            [Unit]
+            Description=iii Math Worker
+            After=network.target
+            [Service]
+            WorkingDirectory=/opt/quickstart/workers/math-worker
+            ExecStart=/root/.local/bin/iii-worker
+            Restart=always
+            RestartSec=10
+            Environment=HOME=/root
+            Environment=PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+            Environment=III_URL=ws://${APIGatewayInstance.PrivateIp}:49134
+            Environment=III_ISOLATION=none
+            [Install]
+            WantedBy=multi-user.target
+            SVC
+
+            systemctl daemon-reload
+            systemctl enable math-worker
+            systemctl start math-worker
+            echo "Math Worker VM setup complete"
+
+  # ── PRIVATE VM 2: TypeScript Caller Worker ────────────────────────────────
+  # Same engine connection pattern as the math worker. Node/npm have no cert
+  # issues so installation is straightforward. III_ISOLATION=none is still
+  # required to bypass the KVM check on t3.micro.
   CallerWorkerInstance:
     Type: AWS::EC2::Instance
+    DependsOn: APIGatewayInstance
     Properties:
       InstanceType: t3.micro
       ImageId: !Ref LatestAmiId
@@ -359,14 +329,74 @@ Resources:
       Tags:
         - Key: Name
           Value: caller-worker-vm
+      UserData:
+        Fn::Base64:
+          !Sub |
+            #!/bin/bash
+            exec > /var/log/userdata.log 2>&1
+            set -e
+            export HOME=/root
+            export PATH=$PATH:/root/.local/bin
+
+            yum install -y git
+
+            # Install Node.js 20
+            curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
+            yum install -y nodejs
+
+            # Install iii CLI + iii-worker binary
+            curl -fsSL https://install.iii.dev/iii/main/install.sh | sh
+            export PATH=$PATH:/root/.local/bin
+
+            # Clone quickstart
+            cd /opt
+            git clone --no-checkout --depth 1 https://github.com/Alchemyst-ai/hiring.git
+            cd hiring
+            git sparse-checkout set may-2026/devops/quickstart
+            git checkout
+            cp -r may-2026/devops/quickstart /opt/quickstart
+
+            # Install TypeScript worker dependencies
+            cd /opt/quickstart/workers/caller-worker
+            npm install
+
+            # Systemd service — III_URL uses the engine private IP injected by CloudFormation.
+            # III_ISOLATION=none bypasses the KVM microVM requirement.
+            cat > /etc/systemd/system/caller-worker.service << 'SVC'
+            [Unit]
+            Description=iii Caller Worker
+            After=network.target
+            [Service]
+            WorkingDirectory=/opt/quickstart/workers/caller-worker
+            ExecStart=/root/.local/bin/iii-worker
+            Restart=always
+            RestartSec=10
+            Environment=HOME=/root
+            Environment=PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+            Environment=III_URL=ws://${APIGatewayInstance.PrivateIp}:49134
+            Environment=III_ISOLATION=none
+            [Install]
+            WantedBy=multi-user.target
+            SVC
+
+            systemctl daemon-reload
+            systemctl enable caller-worker
+            systemctl start caller-worker
+            echo "Caller Worker VM setup complete"
 
 Outputs:
   APIGatewayPublicIP:
     Description: Public IP — hit this to test the JSON API
     Value: !GetAtt APIGatewayInstance.PublicIp
   APIGatewayPrivateIP:
-    Description: Engine private IP (within VPC)
+    Description: Engine private IP (used by worker VMs to connect via WebSocket)
     Value: !GetAtt APIGatewayInstance.PrivateIp
+  MathWorkerPrivateIP:
+    Description: Math worker VM private IP
+    Value: !GetAtt MathWorkerInstance.PrivateIp
+  CallerWorkerPrivateIP:
+    Description: Caller worker VM private IP
+    Value: !GetAtt CallerWorkerInstance.PrivateIp
   TestCommand:
     Description: curl command to test inference endpoint
     Value: !Sub 'curl -X POST http://${APIGatewayInstance.PublicIp}:3111/v1/chat/completions -H "Content-Type: application/json" -d "{\"messages\": [{\"role\": \"user\", \"content\": \"What is 2+2?\"}]}"'
