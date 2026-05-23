@@ -10,8 +10,8 @@
 A full walkthrough of the deployment process — including CloudFormation stack creation, UserData boot logs, SSH access across the VMs, and the blockers encountered — is available here:
 
 [Watch the walkthrough on Google Drive](https://drive.google.com/file/d/1ThMBmQ1mwMzHr9Vp7I3kt9NRtBgwV4g5/view?usp=sharing)
----
 
+---
 ## Architecture Overview
 
 This project deploys the [iii quickstart](https://iii.dev/docs/quickstart) across **3 EC2 instances** in AWS using a secure VPC architecture with full infrastructure-as-code via CloudFormation.
