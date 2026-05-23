@@ -1,4 +1,4 @@
-# DevOps Internship Assignment — Alchemyst AI
+# DevOps Assignment — Alchemyst AI
 
 **Candidate:** Naboth Tieng  
 **Submission Date:** May 2026  
