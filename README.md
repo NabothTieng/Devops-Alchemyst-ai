@@ -9,7 +9,7 @@
 
 A full walkthrough of the deployment process — including CloudFormation stack creation, UserData boot logs, SSH access across the VMs, and the blockers encountered — is available here:
 
-[Watch the walkthrough on Google Drive](https://drive.google.com/file/d/1ThMBmQ1mwMzHr9Vp7I3kt9NRtBgwV4g5/view?usp=sharing)
+<a href="https://drive.google.com/file/d/1ThMBmQ1mwMzHr9Vp7I3kt9NRtBgwV4g5/view?usp=sharing" target="_blank">Watch the walkthrough on Google Drive</a>
 
 ---
 ## Architecture Overview
